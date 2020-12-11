@@ -20,4 +20,122 @@ syntax = "proto2";
 message HttpProto{
 	required string request = 1;
 	required string reply = 2;
+
+  enum Slash {
+    NONE = 0; // Seperate path segments using ""
+    FORWARD = 1; // Seperate path segments using /
+    BACKWARD = 2; // Seperate path segments using \
+  }
+  repeated Slash slashes = 3 [packed=true];
+
+  required uint32 method = 4; // Take this value, then modulo 8 it and map
+}
+
+enum Method {
+  GET = 0;
+  PUT = 1;
+  POST = 2;
+  COPY = 3;
+  MOVE = 4;
+  LOCK = 5;
+  HEAD = 6;
+  MKCOL = 7;
+  PATCH = 8;
+  TRACE = 9;
+  DELETE = 10;
+  UNLOCK = 11;
+  OPTIONS = 12;
+  PROPFIND = 13;
+  PROPPATCH = 14;
+}
+
+message Url {
+  // If there is a scheme, then it must be followed by a colon. A scheme is in
+  // practice not required in a URL. Therefore, we will define the scheme as
+  // optional but ensure it is followed by a colon in our conversion code if it
+  // is included.
+  optional string scheme = 1;
+
+  enum Slash {
+    NONE = 0; // Seperate path segments using ""
+    FORWARD = 1; // Seperate path segments using /
+    BACKWARD = 2; // Seperate path segments using \
+  }
+  // The syntax rules of the two slashes that precede the host in a URL are
+  // surprisingly complex. They are not required, even if a scheme is included
+  // (http:example.com is treated as valid), and are valid even if a scheme is
+  // not included (//example.com is treated as file:///example.com). They can
+  // even be backslashes (http:\\example.com and http\/example.com are both
+  // valid) and there can be any number of them (http:/example.com and
+  // http://////example.com are both valid).
+  // We will therefore define slashes as a list of enum values (repeated Slash).
+  // In our conversion code, this will be read to append the appropriate kind and
+  // appropriate number of slashes to the URL.
+  repeated Slash slashes = 2 [packed=true];
+
+
+  // The [user:password@] part of the URL shown above is called the userinfo.
+  // Userinfo is not mandatory, but if it is included in a URL, then it must
+  // contain a string called user. There is another optional field in userinfo
+  // called the password. If a password is included, the user must be separated
+  // from it by ":". In either case, the userinfo must be separated from the
+  // host by "@". A URL must have a host if it has a userinfo.
+  // These requirements will be ensured by the conversion code.
+  message Userinfo {
+    required string user = 1;
+    optional string password = 2;
+  }
+  optional Userinfo userinfo = 3;
+
+  // Hosts, like most else in our Url definition, are optional (there are
+  // are URLs such as data URLs that do not have hosts).
+  optional string host = 4;
+
+  // ports are unsigned integers between 1-2^16. The closest type to this in the
+  // proto2 format is uint32. Also if a port number is specified it must be
+  // preceded by a colon (consider "google.com80" 80 will be interpreted as part
+  // of the host). The conversion code will ensure this is the case.
+  optional uint32 port = 5;
+
+  // The rules for the path are somewhat complex. A path is not required,
+  // however if it follows a port or host, it must start with "/" according
+  // to the RFC, though Chromium accepts "\" as it converts all backslashes to
+  // slashes. It does not need to start with "/" if there is no host (in data
+  // URLs for example). Thus we will define path as a repeated string where each
+  // member contains a segment of the path and will be preceded by the
+  // path_separator. The one exception to this is for the first segment if
+  // path_seperator == NONE and there is a non empty path and host, then the
+  // first segment will be preceeded by "/".
+  repeated string path = 6;
+  required Slash path_separator = 7 [default = FORWARD];
+
+  // A query must preceded by "?". This will be ensured in the conversion
+  // code. Queries can have many components which the converter will separate
+  // using "&", as is the convention.
+  repeated string query = 8;
+
+  // A fragment must preceded by "#". This will be ensured in the conversion
+  // code.
+  optional string fragment = 9;
+}
+
+message HttpRequest {
+  required Method method = 1;
+  required Url url = 2;
+  required float version = 3;
+  repeated string field = 4; // Host, Connection, User-Agent, Accept, Referrer, etc
+  optional string body = 5;
+}
+
+message HttpReply {
+  required float version = 1;
+  required uint32 statuscode = 2;
+  required string statusstr = 3;
+  repeated string field = 4; // Cache-Control, Server, Connection, Content-Length, etc
+  optional string body = 5;
+}
+
+message HttpProtocol {
+  required HttpRequest request = 1;
+  required HttpReply reply = 2;
 }

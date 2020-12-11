@@ -30,7 +30,7 @@ extern "C" {
 #include "libprotobuf-mutator/src/libfuzzer/libfuzzer_macro.h"
 
 static char configuration[] =
-"error_log stderr emerg;\n"
+"error_log error-log-main emerg;\n"
 "events {\n"
 "    use epoll;\n"
 "    worker_connections 2;\n"
@@ -44,7 +44,7 @@ static char configuration[] =
 "      default upgrade;\n"
 "      '' close;\n"
 "    }\n"
-"    error_log stderr emerg;\n"
+"    error_log error-log-http emerg;\n"
 "    access_log off;\n"
 "    map $subdomain $nss {\n"
 "      default local_upstream;\n"
@@ -100,8 +100,9 @@ static char *my_argv[2];
 static char arg1[] = {0, 0xA, 0};
 
 extern char **environ;
+static char **ngx_os_environ;
 
-static const char *config_file = "/tmp/http_config.conf";
+static const char *config_file = "http_config.conf";
 
 struct fuzzing_data {
   const uint8_t *data;
@@ -116,6 +117,173 @@ static ngx_http_request_t *req_reply;
 static ngx_http_cleanup_t cln_new = {};
 static int cln_added;
 
+static std::string slash_to_string(int slash) {
+  if (slash == HttpProto::NONE)
+    return "";
+  if (slash == HttpProto::FORWARD)
+    return "/";
+  if (slash == HttpProto::BACKWARD) {
+    return "\\";
+  }
+  assert(false && "Received unexpected value for slash");
+
+  // Silence compiler warning about not returning in non-void function.
+  return "";
+}
+
+static std::string method_to_string(uint32_t method) {
+  switch (method) {
+    case 0:
+      return "GET"; // Space at end in ngx_http_parse.c
+    case 1:
+      return "PUT"; // Space at end in ngx_http_parse.c
+    case 2:
+      return "POST";
+    case 3:
+      return "COPY";
+    case 4:
+      return "MOVE";
+    case 5:
+      return "LOCK";
+    case 6:
+      return "HEAD";
+    case 7:
+      return "MKCOL";
+    case 8:
+      return "PATCH";
+    case 9:
+      return "TRACE";
+    case 10:
+      return "DELETE";
+    case 11:
+      return "UNLOCK";
+    case 12:
+      return "OPTIONS"; // Space at end in ngx_http_parse.c
+    case 13:
+      return "PROPFIND";
+    case 14:
+      return "PROPPATCH";
+    default:
+      assert(false && "Received unexpected value for slash");
+  }
+
+  // Silence compiler warning about not returning in non-void function.
+  return "";
+}
+
+// Converts a URL in Protocol Buffer format to a url in string format.
+// Since protobuf is a relatively simple format, fuzzing targets that do not
+// accept protobufs (such as this one) will require code to convert from
+// protobuf to the accepted format (string in this case).
+static std::string url_protobuf_to_string(const Url& url) {
+  // Build url_string piece by piece from url and then return it.
+  std::string url_string = std::string("");
+
+  if (url.has_scheme()) {  // Get the scheme if Url has it.
+    // Append the scheme to the url. This may be empty. Then append a colon
+    // which is mandatory if there is a scheme.
+    url_string += url.scheme() + ":";
+  }
+
+  // Just append the slashes without doing validation, since it would be too
+  // complex. libFuzzer will hopefully figure out good values.
+  for (const int slash : url.slashes())
+    url_string += slash_to_string(slash);
+
+  // Get host. This is simple since hosts are simply strings according to our
+  // definition.
+  if (url.has_host()) {
+    // Get userinfo if libFuzzer set it. Ensure that user is seperated
+    // from the password by ":" (if a password is included) and that userinfo is
+    // separated from the host by "@".
+    if (url.has_userinfo()) {
+      url_string += url.userinfo().user();
+      if (url.userinfo().has_password()) {
+        url_string += ":";
+        url_string += url.userinfo().password();
+      }
+      url_string += "@";
+    }
+    url_string += url.host();
+
+    // As explained in url.proto, if libFuzzer included a port in url ensure
+    // that it is preceded by the host and then ":".
+    if (url.has_port())
+      // Convert url.port() from an unsigned 32 bit int before appending it.
+      url_string += ":" + std::to_string(url.port());
+  }
+
+  // Append the path segments to the url, with each segment separated by
+  // the path_separator.
+  bool first_segment = true;
+  std::string path_separator = slash_to_string(url.path_separator());
+  for (const std::string& path_segment : url.path()) {
+    // There does not need to be a path, but if there is a path and a host,
+    // ensure the path begins with "/".
+    if (url.has_host() && first_segment) {
+      url_string += "/" + path_segment;
+      first_segment = false;
+    } else
+      url_string += path_separator + path_segment;
+  }
+
+  // Queries must be started by "?". If libFuzzer included a query in url,
+  // ensure that it is preceded by "?". Also Seperate query components with
+  // ampersands as is the convention.
+  bool first_component = true;
+  for (const std::string& query_component : url.query()) {
+    if (first_component) {
+      url_string += "?" + query_component;
+      first_component = false;
+    } else
+      url_string += "&" + query_component;
+  }
+
+  // Fragments must be started by "#". If libFuzzer included a fragment
+  // in url, ensure that it is preceded by "#".
+  if (url.has_fragment())
+    url_string += "#" + url.fragment();
+
+  return url_string;
+}
+
+static void request_protobuf_to_string(const HttpRequest& httprequest, std::string * req) {
+  *req += method_to_string(httprequest.method());
+  *req += " "; // XXX XXX CRLF
+  *req += url_protobuf_to_string(httprequest.url());
+  *req += " HTTP/";
+  *req += std::to_string(httprequest.version());
+  *req += "\\r\\n";
+
+  for (const std::string& i : httprequest.field()) {
+    *req += i;
+    *req += "\\r\\n";
+  }
+
+  if (httprequest.has_body()) {
+    *req += httprequest.body();
+    *req += "\\r\\n";
+  }
+}
+
+static void reply_protobuf_to_string(const HttpReply& httpreply, std::string * rep) {
+  *rep += "HTTP/";
+  *rep += std::to_string(httpreply.version());
+  *rep += " ";
+  *rep += httpreply.statusstr();
+  *rep += "\\r\\n";
+
+  for (const std::string& i : httpreply.field()) {
+    *rep += i;
+    *rep += "\\r\\n";
+  }
+
+  if (httpreply.has_body()) {
+    *rep += httpreply.body();
+    *rep += "\\r\\n";
+  }
+}
+
 // Called when finalizing the request to upstream
 // Do not need to clean the request pool
 static void cleanup_reply(void *data) { req_reply = NULL; }
@@ -128,6 +296,8 @@ static ssize_t request_recv_handler(ngx_connection_t *c, u_char *buf,
   memcpy(buf, request.data, size);
   request.data += size;
   request.data_len -= size;
+  c->read->ready = 0;
+  c->read->eof = 1;
   return size;
 }
 
@@ -175,6 +345,7 @@ static ngx_chain_t *send_chain(ngx_connection_t *c, ngx_chain_t *in,
 extern "C" int InitializeNginx(void) {
   ngx_log_t *log;
   ngx_cycle_t init_cycle;
+  ngx_core_conf_t *ccf;
 
   if (access("nginx.sock", F_OK) != -1) {
     remove("nginx.sock");
@@ -209,8 +380,9 @@ extern "C" int InitializeNginx(void) {
   char *env_before = environ[0];
   environ[0] = my_argv[0] + 1;
   ngx_os_init(log);
-  free(environ[0]);
+  //free(environ[0]);
   environ[0] = env_before;
+  ngx_os_environ = environ;
 
   ngx_crc32_table_init();
   ngx_preinit_modules();
@@ -226,11 +398,25 @@ extern "C" int InitializeNginx(void) {
   ngx_os_status(cycle->log);
   ngx_cycle = cycle;
 
+//  ccf = (ngx_core_conf_t *) ngx_get_conf(cycle->conf_ctx, ngx_core_module);
+//  if (ccf->master && ngx_process == NGX_PROCESS_SINGLE) {
+//    ngx_process = NGX_PROCESS_MASTER;
+//  }
+//
+//  if (ngx_process == NGX_PROCESS_SINGLE) {
+//    ngx_single_process_cycle(cycle);
+//  } else {
+//    ngx_master_process_cycle(cycle);
+//  }
+
   ngx_event_actions.add = add_event;
   ngx_event_actions.init = init_event;
   ngx_io.send_chain = send_chain;
   ngx_event_flags = 1;
+  ngx_queue_init(&ngx_posted_accept_events);
+  ngx_queue_init(&ngx_posted_events);
   ngx_event_timer_init(cycle->log);
+
   return 0;
 }
 
@@ -239,7 +425,7 @@ extern "C" long int invalid_call(ngx_connection_s *a, ngx_chain_s *b,
   return 0;
 }
 
-DEFINE_PROTO_FUZZER(const HttpProto &input) {
+DEFINE_PROTO_FUZZER(const HttpProtocol &httpprocotol) {
   static int init = InitializeNginx();
   assert(init == 0);
 
@@ -257,14 +443,14 @@ DEFINE_PROTO_FUZZER(const HttpProto &input) {
   upstream = NULL;
   cln_added = 0;
 
-  const char *req_string = input.request().c_str();
-  size_t req_len = strlen(req_string);
-  const char *rep_string = input.reply().c_str();
-  size_t rep_len = strlen(rep_string);
-  request.data = (const uint8_t *)req_string;
-  request.data_len = req_len;
-  reply.data = (const uint8_t *)rep_string;
-  reply.data_len = rep_len;
+  std::string req_string = std::string("");
+  std::string rep_string = std::string("");
+  request_protobuf_to_string(httpprocotol.request(), &req_string);
+  reply_protobuf_to_string(httpprocotol.reply(), &rep_string);
+  request.data = (const uint8_t *)req_string.c_str();
+  request.data_len = req_string.length();
+  reply.data = (const uint8_t *)rep_string.c_str();
+  reply.data_len = rep_string.length();
 
   // Use listening entry created from configuration
   ls = (ngx_listening_t *)ngx_cycle->listening.elts;
@@ -307,4 +493,15 @@ DEFINE_PROTO_FUZZER(const HttpProto &input) {
 
   // Will redirect to http parser
   ngx_http_init_connection(c);
+
+  // Clean-up in case of error
+  if (req_reply && upstream && upstream->cleanup) {
+    (*(upstream->cleanup))(req_reply);
+    if (!c->destroyed)
+      ngx_http_close_connection(c);
+  } else if (!c->destroyed) {
+    ngx_http_request_t *r = (ngx_http_request_t *)(c->data);
+    ngx_http_free_request(r, 0);
+    ngx_http_close_connection(c);
+  }
 }
